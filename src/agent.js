@@ -41,6 +41,10 @@ const StateAnnotation = Annotation.Root({
     })
 });
 
+// Global Cache to prevent re-scraping
+let globalEmailCache = [];
+let highestScrapedPage = 0;
+
 // 2. Define Nodes
 
 async function orchestratorNode(state) {
@@ -65,79 +69,101 @@ Output ONLY valid JSON matching this schema:
   "target_index_range": [start, end] | null
 }`;
 
-    try {
-        const res = await fetch(`https://openrouter.ai/api/v1/chat/completions`, {
-            method: 'POST',
-            headers: { 
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${apiKey}`,
-                'HTTP-Referer': 'https://github.com/roundcube-agent',
-                'X-Title': 'Roundcube Agent'
-            },
-            body: JSON.stringify({
-                model: 'openrouter/free',
-                messages: [
-                    { role: "system", content: systemPrompt },
-                    { role: "user", content: "Query: " + state.user_query }
-                ]
-            })
-        });
-
-        if (!res.ok) {
-            const errorData = await res.json().catch(() => ({}));
-            if (res.status === 429) return { dom_error: true, final_answer: "API Limit Reached! You have exhausted your OpenRouter API limits." };
-            if (res.status === 401 || res.status === 403) return { dom_error: true, final_answer: "Invalid API Key! Please check your OpenRouter API key." };
-            return { dom_error: true, final_answer: `API Error (${res.status}): ${errorData.error?.message || res.statusText}` };
-        }
-
-        const data = await res.json();
-        const textContent = data.choices[0].message.content;
-        if (!textContent) throw new Error("Empty response from model: " + JSON.stringify(data));
-        
-        let parsed;
+    let lastError = null;
+    for (let attempt = 0; attempt <= 2; attempt++) {
         try {
-            parsed = JSON.parse(textContent.trim());
-        } catch (e) {
-            const match = textContent.match(/```(?:json)?([\s\S]*?)```/);
+            const res = await fetch(`https://openrouter.ai/api/v1/chat/completions`, {
+                method: 'POST',
+                headers: { 
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${apiKey}`,
+                    'HTTP-Referer': 'https://github.com/roundcube-agent',
+                    'X-Title': 'Roundcube Agent'
+                },
+                body: JSON.stringify({
+                    model: 'openrouter/free',
+                    messages: [
+                        { role: "system", content: systemPrompt },
+                        { role: "user", content: "Query: " + state.user_query }
+                    ]
+                })
+            });
+
+            if (!res.ok) {
+                const errorData = await res.json().catch(() => ({}));
+                if (res.status === 429) return { dom_error: true, final_answer: "API Limit Reached! You have exhausted your OpenRouter API limits." };
+                if (res.status === 401 || res.status === 403) return { dom_error: true, final_answer: "Invalid API Key! Please check your OpenRouter API key." };
+                throw new Error(`API Error (${res.status}): ${errorData.error?.message || res.statusText}`);
+            }
+
+            const data = await res.json();
+            const textContent = data.choices[0].message.content;
+            if (!textContent) throw new Error("Empty response from model");
+            
+            let parsed;
             try {
-                if (match) parsed = JSON.parse(match[1].trim());
-                else throw new Error("No markdown");
-            } catch (err) {
-                console.warn("Using regex fallback for Orchestrator due to malformed JSON.");
-                const actionMatch = textContent.match(/"action"\s*:\s*"([^"]+)"/);
-                const rangeMatch = textContent.match(/"target_index_range"\s*:\s*\[\s*(\d+)\s*,\s*(\d+)\s*\]/);
-                const pagesMatch = textContent.match(/"pages_to_scrape"\s*:\s*(\d+)/);
-                if (actionMatch) {
-                    parsed = {
-                        action: actionMatch[1],
-                        target_index_range: rangeMatch ? [parseInt(rangeMatch[1]), parseInt(rangeMatch[2])] : null,
-                        pages_to_scrape: pagesMatch ? parseInt(pagesMatch[1]) : 1
-                    };
-                } else {
-                    throw new Error("Model did not return valid JSON: " + textContent);
+                parsed = JSON.parse(textContent.trim());
+            } catch (e) {
+                const match = textContent.match(/```(?:json)?([\s\S]*?)```/);
+                try {
+                    if (match) parsed = JSON.parse(match[1].trim());
+                    else throw new Error("No markdown");
+                } catch (err) {
+                    console.warn("Using regex fallback for Orchestrator due to malformed JSON.");
+                    const actionMatch = textContent.match(/"action"\s*:\s*"([^"]+)"/);
+                    const rangeMatch = textContent.match(/"target_index_range"\s*:\s*\[\s*(\d+)\s*,\s*(\d+)\s*\]/);
+                    const pagesMatch = textContent.match(/"pages_to_scrape"\s*:\s*(\d+)/);
+                    if (actionMatch) {
+                        parsed = {
+                            action: actionMatch[1],
+                            target_index_range: rangeMatch ? [parseInt(rangeMatch[1]), parseInt(rangeMatch[2])] : null,
+                            pages_to_scrape: pagesMatch ? parseInt(pagesMatch[1]) : 1
+                        };
+                    } else {
+                        throw new Error("Model did not return valid JSON: " + textContent);
+                    }
                 }
             }
-        }
-        
-        console.log("Orchestrator plan:", parsed);
+            
+            console.log("Orchestrator plan:", parsed);
 
-        if (parsed.action === "chat") {
-            return { action: "chat", found_answer: true, final_answer: parsed.response || "" };
-        }
+            if (parsed.action === "chat") {
+                return { action: "chat", found_answer: true, final_answer: parsed.response || "" };
+            }
 
-        return {
-            action: parsed.action,
-            max_pages: parsed.pages_to_scrape || 2,
-            target_index_range: parsed.target_index_range || null
-        };
-    } catch (e) {
-        console.error("Orchestrator Exception:", e);
-        return { dom_error: true, final_answer: "Failed to contact OpenRouter Orchestrator: " + e.message };
+            return {
+                action: parsed.action,
+                max_pages: parsed.pages_to_scrape || 2,
+                target_index_range: parsed.target_index_range || null
+            };
+        } catch (e) {
+            console.warn(`Orchestrator attempt ${attempt + 1} failed:`, e.message);
+            lastError = e;
+            await new Promise(r => setTimeout(r, 1000));
+        }
     }
+    console.error("Orchestrator Exception after retries:", lastError);
+    return { dom_error: true, final_answer: "Failed to contact OpenRouter Orchestrator: " + lastError.message };
 }
 
 async function domScraperNode(state) {
     console.log("[Node] domScraperNode starting for page:", state.current_page);
+    
+    // Check if we have this page in cache
+    if (state.current_page <= highestScrapedPage && globalEmailCache.length > 0) {
+        console.log(`Page ${state.current_page} is already in cache. Using cache.`);
+        updateUI(`Using cached emails for page ${state.current_page}...`, true);
+        
+        const startIndex = (state.current_page - 1) * 50;
+        const endIndex = state.current_page * 50;
+        const pageEmails = globalEmailCache.slice(startIndex, endIndex);
+
+        return {
+            scraped_emails: pageEmails,
+            has_next_page: true
+        };
+    }
+    
     updateUI("Initializing page " + state.current_page + " scrape...", true);
     
     // Get active tab
@@ -161,7 +187,7 @@ async function domScraperNode(state) {
 
         if (chrome.runtime.lastError || !response) {
             console.error("Message error:", chrome.runtime.lastError);
-            return { dom_error: true, final_answer: "Ensure you are on the Roundcube page and refresh." };
+            return { dom_error: true, final_answer: "Could not reach content script. Ensure you are on the Roundcube page and refresh the tab." };
         }
 
         console.log("Received response from content script:", response);
@@ -169,6 +195,10 @@ async function domScraperNode(state) {
         if (!response.success) {
             return { dom_error: true, final_answer: "Scraping error: " + response.error };
         }
+
+        // Add to cache
+        globalEmailCache = [...globalEmailCache, ...response.emails];
+        highestScrapedPage = state.current_page;
 
         return {
             scraped_emails: response.emails,
@@ -208,82 +238,82 @@ Respond ONLY with valid JSON matching this schema:
 
     const userPrompt = `Query: ${state.user_query}\n\nEmails JSON:\n${JSON.stringify(state.scraped_emails, null, 2)}`;
 
-    try {
-        const res = await fetch(`https://openrouter.ai/api/v1/chat/completions`, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${apiKey}`,
-                'HTTP-Referer': 'https://github.com/roundcube-agent',
-                'X-Title': 'Roundcube Agent'
-            },
-            body: JSON.stringify({
-                model: 'openrouter/free',
-                messages: [
-                    { role: "system", content: systemPrompt },
-                    { role: "user", content: userPrompt }
-                ]
-            })
-        });
-
-        console.log("OpenRouter API response status:", res.status);
-
-        if (!res.ok) {
-            const errorData = await res.json().catch(() => ({}));
-            if (res.status === 429) {
-                return { dom_error: true, final_answer: "API Limit Reached! You have exhausted your OpenRouter API limits." };
-            }
-            if (res.status === 401 || res.status === 403) {
-                 return { dom_error: true, final_answer: "Invalid API Key! Please check your OpenRouter API key." };
-            }
-            return { dom_error: true, final_answer: `API Error (${res.status}): ${errorData.error?.message || res.statusText}` };
-        }
-
-        const data = await res.json();
-        
-        if (data.error) {
-            return { dom_error: true, final_answer: "API Error: " + data.error.message };
-        }
-
-        const textContent = data.choices[0].message.content;
-        if (!textContent) throw new Error("Empty response from model: " + JSON.stringify(data));
-
-        let parsed;
+    let lastError = null;
+    for (let attempt = 0; attempt <= 2; attempt++) {
         try {
-            parsed = JSON.parse(textContent.trim());
-        } catch (e) {
-            const match = textContent.match(/```(?:json)?([\s\S]*?)```/);
+            const res = await fetch(`https://openrouter.ai/api/v1/chat/completions`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${apiKey}`,
+                    'HTTP-Referer': 'https://github.com/roundcube-agent',
+                    'X-Title': 'Roundcube Agent'
+                },
+                body: JSON.stringify({
+                    model: 'openrouter/free',
+                    messages: [
+                        { role: "system", content: systemPrompt },
+                        { role: "user", content: userPrompt }
+                    ]
+                })
+            });
+
+            console.log("OpenRouter API response status:", res.status);
+
+            if (!res.ok) {
+                const errorData = await res.json().catch(() => ({}));
+                if (res.status === 429) return { dom_error: true, final_answer: "API Limit Reached! You have exhausted your OpenRouter API limits." };
+                if (res.status === 401 || res.status === 403) return { dom_error: true, final_answer: "Invalid API Key! Please check your OpenRouter API key." };
+                throw new Error(`API Error (${res.status}): ${errorData.error?.message || res.statusText}`);
+            }
+
+            const data = await res.json();
+            
+            if (data.error) throw new Error("API Error: " + data.error.message);
+
+            const textContent = data.choices[0].message.content;
+            if (!textContent) throw new Error("Empty response from model");
+
+            let parsed;
             try {
-                if (match) parsed = JSON.parse(match[1].trim());
-                else throw new Error("No markdown");
-            } catch (err) {
-                console.warn("Using regex fallback for Synthesizer due to malformed JSON.");
-                const foundMatch = textContent.match(/"found"\s*:\s*(true|false)/);
-                let answerText = "";
-                const answerMatch = textContent.match(/"answer"\s*:\s*"([\s\S]*?)"\s*\}/);
-                if (answerMatch) answerText = answerMatch[1].replace(/\\n/g, '\n').replace(/\\"/g, '"');
-                
-                if (foundMatch) {
-                    parsed = {
-                        found: foundMatch[1] === "true",
-                        answer: answerText
-                    };
-                } else {
-                    throw new Error("Model did not return valid JSON: " + textContent);
+                parsed = JSON.parse(textContent.trim());
+            } catch (e) {
+                const match = textContent.match(/```(?:json)?([\s\S]*?)```/);
+                try {
+                    if (match) parsed = JSON.parse(match[1].trim());
+                    else throw new Error("No markdown");
+                } catch (err) {
+                    console.warn("Using regex fallback for Synthesizer due to malformed JSON.");
+                    const foundMatch = textContent.match(/"found"\s*:\s*(true|false)/);
+                    let answerText = "";
+                    const answerMatch = textContent.match(/"answer"\s*:\s*"([\s\S]*?)"\s*\}/);
+                    if (answerMatch) answerText = answerMatch[1].replace(/\\n/g, '\n').replace(/\\"/g, '"');
+                    
+                    if (foundMatch) {
+                        parsed = {
+                            found: foundMatch[1] === "true",
+                            answer: answerText
+                        };
+                    } else {
+                        throw new Error("Model did not return valid JSON: " + textContent);
+                    }
                 }
             }
-        }
-        
-        console.log("Parsed OpenRouter response:", parsed);
+            
+            console.log("Parsed OpenRouter response:", parsed);
 
-        return {
-            found_answer: parsed.found,
-            final_answer: parsed.answer
-        };
-    } catch (e) {
-        console.error("Synthesizer Exception:", e);
-        return { dom_error: true, final_answer: "Failed to contact OpenRouter API: " + e.message };
+            return {
+                found_answer: parsed.found,
+                final_answer: parsed.answer
+            };
+        } catch (e) {
+            console.warn(`Synthesizer attempt ${attempt + 1} failed:`, e.message);
+            lastError = e;
+            await new Promise(r => setTimeout(r, 1000));
+        }
     }
+    console.error("Synthesizer Exception after retries:", lastError);
+    return { dom_error: true, final_answer: "Failed to contact OpenRouter API: " + lastError.message };
 }
 
 // 3. Define Graph Routing Logic
@@ -339,6 +369,17 @@ saveKeyBtn.addEventListener('click', () => {
     setTimeout(() => saveKeyBtn.textContent = 'Save', 2000);
 });
 
+function parseMarkdown(text) {
+    if (!text) return "";
+    let html = text;
+    html = html.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
+    html = html.replace(/\*(.*?)\*/g, '<em>$1</em>');
+    html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+    html = html.replace(/`([^`]+)`/g, '<code style="background:rgba(255,255,255,0.1);padding:2px 4px;border-radius:2px;">$1</code>');
+    html = html.replace(/\n/g, '<br>');
+    return html;
+}
+
 function addMessage(role, text) {
     const msgDiv = document.createElement('div');
     msgDiv.className = `message ${role}`;
@@ -346,7 +387,7 @@ function addMessage(role, text) {
     const contentDiv = document.createElement('div');
     contentDiv.className = 'message-content';
     
-    let htmlText = text.replace(/\n/g, '<br>');
+    let htmlText = parseMarkdown(text);
     contentDiv.innerHTML = htmlText;
     
     msgDiv.appendChild(contentDiv);
