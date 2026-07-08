@@ -19,8 +19,8 @@ async function fetchEmailBody(url) {
     }
 }
 
-async function extractRoundcubeEmails() {
-    console.log("[Roundcube Agent] Starting extractRoundcubeEmails()");
+async function extractRoundcubeEmails(targetIndexRange = null) {
+    console.log("[Roundcube Agent] Starting extractRoundcubeEmails() with range:", targetIndexRange);
     let extractedEmails = [];
     
     // In Roundcube, emails are usually rows in a table with ID 'messagelist'
@@ -71,10 +71,19 @@ async function extractRoundcubeEmails() {
 
         // Fetch the bodies for this batch concurrently
         const bodyPromises = batch.map(async (email) => {
-            let bodyText = "No body available";
-            if (email.url) {
+            let bodyText = "Body not fetched (outside target range)";
+            
+            let shouldFetch = true;
+            if (targetIndexRange && Array.isArray(targetIndexRange) && targetIndexRange.length === 2) {
+                if (email.id < targetIndexRange[0] || email.id >= targetIndexRange[1]) {
+                    shouldFetch = false;
+                }
+            }
+
+            if (shouldFetch && email.url) {
                 bodyText = await fetchEmailBody(email.url);
             }
+            
             return {
                 id: email.id,
                 sender: email.sender,
@@ -143,12 +152,12 @@ console.log("[Roundcube Agent] Content script loaded.");
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     console.log("[Roundcube Agent] Received message:", request);
     if (request.action === 'SCRAPE_EMAILS') {
-        const { targetPage } = request;
+        const { targetPage, targetIndexRange } = request;
         
         if (targetPage === 1) {
             // Scrape current view immediately
-            console.log("[Roundcube Agent] Scraping target page 1");
-            extractRoundcubeEmails().then(result => {
+            console.log("[Roundcube Agent] Scraping target page 1 with range:", targetIndexRange);
+            extractRoundcubeEmails(targetIndexRange).then(result => {
                 console.log("[Roundcube Agent] Scraping completed:", result);
                 sendResponse({ success: true, ...result });
             }).catch(err => {
@@ -160,7 +169,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             chrome.runtime.sendMessage({ type: 'SCRAPE_PROGRESS', text: `Navigating to page ${targetPage}...` });
             clickNextPageAndWait().then(navigated => {
                 if (navigated) {
-                    extractRoundcubeEmails().then(result => {
+                    extractRoundcubeEmails(targetIndexRange).then(result => {
                         sendResponse({ success: true, ...result });
                     }).catch(err => {
                         sendResponse({ success: false, error: err.toString() });

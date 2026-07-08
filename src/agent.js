@@ -3,6 +3,14 @@ import { StateGraph, START, END, Annotation } from '@langchain/langgraph';
 // 1. Define State
 const StateAnnotation = Annotation.Root({
     user_query: Annotation(),
+    action: Annotation({
+        reducer: (curr, next) => next,
+        default: () => "scrape"
+    }),
+    target_index_range: Annotation({
+        reducer: (curr, next) => next,
+        default: () => null
+    }),
     current_page: Annotation({
         reducer: (curr, next) => next,
         default: () => 1
@@ -35,6 +43,99 @@ const StateAnnotation = Annotation.Root({
 
 // 2. Define Nodes
 
+async function orchestratorNode(state) {
+    console.log("[Node] orchestratorNode starting...");
+    updateUI("Planning agent actions...", true);
+    
+    const apiKey = localStorage.getItem('openRouterApiKey');
+    if (!apiKey) {
+        return { dom_error: true, final_answer: "Please enter your OpenRouter API Key in the settings above." };
+    }
+
+    const systemPrompt = `You are the Orchestrator Agent for a webmail assistant. Decide the best action based on the user's query.
+- If the user is just saying hello, asking a general question unrelated to their inbox, or chatting, set "action": "chat" and provide a "response".
+- If the user asks about specific emails (e.g., "first 10 emails", "emails 20-30"), set "action": "scrape" and specify the "target_index_range" array [start, end]. Note that each page has 50 emails. So "emails 10-20" means [10, 20].
+- If they ask a general search query (e.g., "what did joglekar send", "find event details"), set "action": "scrape", and "target_index_range": null (to scrape all emails on the page).
+
+Output ONLY valid JSON matching this schema:
+{
+  "action": "chat" | "scrape",
+  "response": "string, only if action is chat",
+  "pages_to_scrape": 1,
+  "target_index_range": [start, end] | null
+}`;
+
+    try {
+        const res = await fetch(`https://openrouter.ai/api/v1/chat/completions`, {
+            method: 'POST',
+            headers: { 
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${apiKey}`,
+                'HTTP-Referer': 'https://github.com/roundcube-agent',
+                'X-Title': 'Roundcube Agent'
+            },
+            body: JSON.stringify({
+                model: 'openrouter/free',
+                messages: [
+                    { role: "system", content: systemPrompt },
+                    { role: "user", content: "Query: " + state.user_query }
+                ]
+            })
+        });
+
+        if (!res.ok) {
+            const errorData = await res.json().catch(() => ({}));
+            if (res.status === 429) return { dom_error: true, final_answer: "API Limit Reached! You have exhausted your OpenRouter API limits." };
+            if (res.status === 401 || res.status === 403) return { dom_error: true, final_answer: "Invalid API Key! Please check your OpenRouter API key." };
+            return { dom_error: true, final_answer: `API Error (${res.status}): ${errorData.error?.message || res.statusText}` };
+        }
+
+        const data = await res.json();
+        const textContent = data.choices[0].message.content;
+        if (!textContent) throw new Error("Empty response from model: " + JSON.stringify(data));
+        
+        let parsed;
+        try {
+            parsed = JSON.parse(textContent.trim());
+        } catch (e) {
+            const match = textContent.match(/```(?:json)?([\s\S]*?)```/);
+            try {
+                if (match) parsed = JSON.parse(match[1].trim());
+                else throw new Error("No markdown");
+            } catch (err) {
+                console.warn("Using regex fallback for Orchestrator due to malformed JSON.");
+                const actionMatch = textContent.match(/"action"\s*:\s*"([^"]+)"/);
+                const rangeMatch = textContent.match(/"target_index_range"\s*:\s*\[\s*(\d+)\s*,\s*(\d+)\s*\]/);
+                const pagesMatch = textContent.match(/"pages_to_scrape"\s*:\s*(\d+)/);
+                if (actionMatch) {
+                    parsed = {
+                        action: actionMatch[1],
+                        target_index_range: rangeMatch ? [parseInt(rangeMatch[1]), parseInt(rangeMatch[2])] : null,
+                        pages_to_scrape: pagesMatch ? parseInt(pagesMatch[1]) : 1
+                    };
+                } else {
+                    throw new Error("Model did not return valid JSON: " + textContent);
+                }
+            }
+        }
+        
+        console.log("Orchestrator plan:", parsed);
+
+        if (parsed.action === "chat") {
+            return { action: "chat", found_answer: true, final_answer: parsed.response || "" };
+        }
+
+        return {
+            action: parsed.action,
+            max_pages: parsed.pages_to_scrape || 2,
+            target_index_range: parsed.target_index_range || null
+        };
+    } catch (e) {
+        console.error("Orchestrator Exception:", e);
+        return { dom_error: true, final_answer: "Failed to contact OpenRouter Orchestrator: " + e.message };
+    }
+}
+
 async function domScraperNode(state) {
     console.log("[Node] domScraperNode starting for page:", state.current_page);
     updateUI("Initializing page " + state.current_page + " scrape...", true);
@@ -53,7 +154,8 @@ async function domScraperNode(state) {
         const response = await new Promise((resolve) => {
             chrome.tabs.sendMessage(tab.id, { 
                 action: 'SCRAPE_EMAILS', 
-                targetPage: state.current_page 
+                targetPage: state.current_page,
+                targetIndexRange: state.target_index_range
             }, resolve);
         });
 
@@ -87,9 +189,9 @@ async function synthesizerNode(state) {
     console.log("[Node] synthesizerNode starting with emails count:", state.scraped_emails.length);
     updateUI("Synthesizing data from " + state.scraped_emails.length + " emails...", true);
     
-    const apiKey = localStorage.getItem('geminiApiKey');
+    const apiKey = localStorage.getItem('openRouterApiKey');
     if (!apiKey) {
-        return { dom_error: true, final_answer: "Please enter your Gemini API Key in the settings above." };
+        return { dom_error: true, final_answer: "Please enter your OpenRouter API Key in the settings above." };
     }
 
     const systemPrompt = `You are an exact data-extraction agent. Review the provided webmail JSON data to answer the user's query.
@@ -107,30 +209,32 @@ Respond ONLY with valid JSON matching this schema:
     const userPrompt = `Query: ${state.user_query}\n\nEmails JSON:\n${JSON.stringify(state.scraped_emails, null, 2)}`;
 
     try {
-        const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key=${apiKey}`, {
+        const res = await fetch(`https://openrouter.ai/api/v1/chat/completions`, {
             method: 'POST',
             headers: {
-                'Content-Type': 'application/json'
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${apiKey}`,
+                'HTTP-Referer': 'https://github.com/roundcube-agent',
+                'X-Title': 'Roundcube Agent'
             },
             body: JSON.stringify({
-                contents: [
-                    { role: "user", parts: [{ text: systemPrompt + "\n\n" + userPrompt }] }
-                ],
-                generationConfig: {
-                    responseMimeType: "application/json"
-                }
+                model: 'openrouter/free',
+                messages: [
+                    { role: "system", content: systemPrompt },
+                    { role: "user", content: userPrompt }
+                ]
             })
         });
 
-        console.log("Gemini API response status:", res.status);
+        console.log("OpenRouter API response status:", res.status);
 
         if (!res.ok) {
             const errorData = await res.json().catch(() => ({}));
             if (res.status === 429) {
-                return { dom_error: true, final_answer: "API Limit Reached! You have exhausted your Gemini API limits. Please wait or use a different key." };
+                return { dom_error: true, final_answer: "API Limit Reached! You have exhausted your OpenRouter API limits." };
             }
             if (res.status === 401 || res.status === 403) {
-                 return { dom_error: true, final_answer: "Invalid API Key! Please check your Gemini API key." };
+                 return { dom_error: true, final_answer: "Invalid API Key! Please check your OpenRouter API key." };
             }
             return { dom_error: true, final_answer: `API Error (${res.status}): ${errorData.error?.message || res.statusText}` };
         }
@@ -141,9 +245,36 @@ Respond ONLY with valid JSON matching this schema:
             return { dom_error: true, final_answer: "API Error: " + data.error.message };
         }
 
-        const textResponse = data.candidates[0].content.parts[0].text;
-        const parsed = JSON.parse(textResponse);
-        console.log("Parsed Gemini response:", parsed);
+        const textContent = data.choices[0].message.content;
+        if (!textContent) throw new Error("Empty response from model: " + JSON.stringify(data));
+
+        let parsed;
+        try {
+            parsed = JSON.parse(textContent.trim());
+        } catch (e) {
+            const match = textContent.match(/```(?:json)?([\s\S]*?)```/);
+            try {
+                if (match) parsed = JSON.parse(match[1].trim());
+                else throw new Error("No markdown");
+            } catch (err) {
+                console.warn("Using regex fallback for Synthesizer due to malformed JSON.");
+                const foundMatch = textContent.match(/"found"\s*:\s*(true|false)/);
+                let answerText = "";
+                const answerMatch = textContent.match(/"answer"\s*:\s*"([\s\S]*?)"\s*\}/);
+                if (answerMatch) answerText = answerMatch[1].replace(/\\n/g, '\n').replace(/\\"/g, '"');
+                
+                if (foundMatch) {
+                    parsed = {
+                        found: foundMatch[1] === "true",
+                        answer: answerText
+                    };
+                } else {
+                    throw new Error("Model did not return valid JSON: " + textContent);
+                }
+            }
+        }
+        
+        console.log("Parsed OpenRouter response:", parsed);
 
         return {
             found_answer: parsed.found,
@@ -151,11 +282,18 @@ Respond ONLY with valid JSON matching this schema:
         };
     } catch (e) {
         console.error("Synthesizer Exception:", e);
-        return { dom_error: true, final_answer: "Failed to contact Gemini API: " + e.message };
+        return { dom_error: true, final_answer: "Failed to contact OpenRouter API: " + e.message };
     }
 }
 
 // 3. Define Graph Routing Logic
+function routeAfterOrchestrator(state) {
+    if (state.action === "chat" || state.dom_error) {
+        return END;
+    }
+    return "domScraper";
+}
+
 function routeAfterSynthesis(state) {
     if (state.found_answer || state.dom_error) {
         return END;
@@ -170,9 +308,11 @@ function routeAfterSynthesis(state) {
 
 // 4. Build Graph
 const workflow = new StateGraph(StateAnnotation)
+    .addNode("orchestrator", orchestratorNode)
     .addNode("domScraper", domScraperNode)
     .addNode("synthesizer", synthesizerNode)
-    .addEdge(START, "domScraper")
+    .addEdge(START, "orchestrator")
+    .addConditionalEdges("orchestrator", routeAfterOrchestrator)
     .addEdge("domScraper", "synthesizer")
     .addConditionalEdges("synthesizer", routeAfterSynthesis);
 
@@ -190,11 +330,11 @@ const apiKeyInput = document.getElementById('apiKey');
 const saveKeyBtn = document.getElementById('saveKeyBtn');
 
 // Load API Key
-const savedKey = localStorage.getItem('geminiApiKey');
+const savedKey = localStorage.getItem('openRouterApiKey');
 if (savedKey) apiKeyInput.value = savedKey;
 
 saveKeyBtn.addEventListener('click', () => {
-    localStorage.setItem('geminiApiKey', apiKeyInput.value);
+    localStorage.setItem('openRouterApiKey', apiKeyInput.value);
     saveKeyBtn.textContent = 'Saved!';
     setTimeout(() => saveKeyBtn.textContent = 'Save', 2000);
 });
