@@ -12,8 +12,8 @@ Roundcube Agent AI is a serverless, locally executing browser extension that bri
 
 ## Usage Guidelines
 
-1. **Install the Extension:** Load the provided folder as an unpacked extension in your Chrome browser (`chrome://extensions/`).
-2. **Open Roundcube:** Navigate to your Roundcube webmail interface and ensure you are logged in.
+1. **Install the Extension:** Load the provided **dist** folder as an unpacked extension in your Chrome browser (`chrome://extensions/`).
+2. **Open Roundcube:** Navigate to your Roundcube webmail interface (IITB webmail at `https://webmail.iitb.ac.in`) and ensure you are logged in.
 3. **Launch the Agent:** Click the extension icon to open the side panel. 
 4. **Configure API Access:** Obtain a free API key from OpenRouter. Paste the key into the configuration bar at the top of the side panel and click "Save".
 5. **Ask Queries:** Type conversational requests into the input box (e.g., "Summarize the first 10 emails," or "What did John send regarding the meeting?"). The agent will automatically scrape the necessary emails, read the contents, and provide a direct answer.
