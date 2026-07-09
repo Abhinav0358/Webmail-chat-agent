@@ -4,14 +4,14 @@ Roundcube Agent AI is a serverless, locally executing browser extension that bri
 
 ## Important Notes
 
-- **Do not open any mail windows**  
+- **Please avoid opening any mail windows**  
   Opening mail windows can interfere with DOM scraping in this basic version.
 
 - **Performance considerations**  
   The system may run slowly since it juggles multiple free models and retries with other models if one returns a `429` (rate limit).
 
 - **Planned improvements**  
-  This is an early/basic version. Optimizations and fixes will be added in future updates.
+  This is a basic working version. I'll try to improve dom scraping and speed in the future.
  
 ## Product Overview
 
